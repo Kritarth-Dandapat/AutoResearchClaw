@@ -143,13 +143,6 @@ class ACPClient:
             pass
         self._session_ready = False
 
-    def __del__(self) -> None:
-        """Best-effort cleanup on garbage collection."""
-        try:
-            self.close()
-        except Exception:  # noqa: BLE001
-            pass
-
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -196,22 +189,90 @@ class ACPClient:
 
     def _send_prompt(self, prompt: str) -> str:
         """Send a prompt via acpx and return the response text."""
-        self._ensure_session()
-        acpx = self._resolve_acpx()
-        if not acpx:
-            raise RuntimeError("acpx not found")
+        def _run() -> subprocess.CompletedProcess[str]:
+            acpx = self._resolve_acpx()
+            if not acpx:
+                raise RuntimeError("acpx not found")
+            # Cursor's ACP server currently has compatibility issues with
+            # session/load in some environments. Use one-shot mode for Cursor
+            # to avoid fragile persistent-session operations.
+            if self.config.agent == "cursor":
+                return subprocess.run(
+                    [
+                        acpx,
+                        "--approve-all",
+                        "--cwd",
+                        self._abs_cwd(),
+                        self.config.agent,
+                        "exec",
+                        prompt,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=self.config.timeout_sec,
+                )
+            return subprocess.run(
+                [
+                    acpx,
+                    "--approve-all",
+                    "--cwd",
+                    self._abs_cwd(),
+                    self.config.agent,
+                    "-s",
+                    self.config.session_name,
+                    prompt,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=self.config.timeout_sec,
+            )
 
-        result = subprocess.run(
-            [acpx, "--approve-all", "--cwd", self._abs_cwd(),
-             self.config.agent, "-s", self.config.session_name,
-             prompt],
-            capture_output=True, text=True,
-            timeout=self.config.timeout_sec,
-        )
+        if self.config.agent != "cursor":
+            self._ensure_session()
+        result = _run()
 
         if result.returncode != 0:
             stderr = result.stderr.strip()
-            raise RuntimeError(f"ACP prompt failed (exit {result.returncode}): {stderr}")
+            # Some adapters can return a non-zero exit code even when the agent
+            # completed the turn successfully. If stdout contains a completed
+            # turn marker and we can extract a non-empty response, accept it.
+            if result.stdout and "[done]" in result.stdout:
+                extracted = self._extract_response(result.stdout)
+                if extracted.strip():
+                    logger.warning(
+                        "ACP prompt nonzero exit (%d) but completed output present; "
+                        "accepting response. stderr=%s",
+                        result.returncode,
+                        stderr[:200],
+                    )
+                    return extracted
+            # Some agents (notably Cursor) can require a reconnect if their
+            # underlying process was recycled. Attempt a single session
+            # re-ensure and retry once in that case.
+            if "agent needs reconnect" in stderr.lower():
+                logger.info(
+                    "ACP agent requested reconnect; re-ensuring session '%s'",
+                    self.config.session_name,
+                )
+                self._session_ready = False
+                self._ensure_session()
+                result = _run()
+                if result.returncode == 0:
+                    return self._extract_response(result.stdout)
+                if result.stdout and "[done]" in result.stdout:
+                    extracted = self._extract_response(result.stdout)
+                    if extracted.strip():
+                        logger.warning(
+                            "ACP prompt retry nonzero exit (%d) but completed output present; "
+                            "accepting response. stderr=%s",
+                            result.returncode,
+                            result.stderr.strip()[:200],
+                        )
+                        return extracted
+                stderr = result.stderr.strip()
+            raise RuntimeError(
+                f"ACP prompt failed (exit {result.returncode}): {stderr}"
+            )
 
         return self._extract_response(result.stdout)
 
